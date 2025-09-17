@@ -46,7 +46,18 @@ compose() {
   COMPOSE_PROJECT_NAME="$proj" docker compose "$@"
 }
 
-# ------- Actions -------
+# Return array of instance names via stdout (one per line)
+list_instances_raw() {
+  [[ -d "${BASE_DIR}" ]] || return 0
+  shopt -s nullglob
+  for d in "${BASE_DIR}"/*; do
+    [[ -d "$d" ]] || continue
+    basename "$d"
+  done
+  shopt -u nullglob
+}
+
+# ----- Actions -----
 install_instance() {
   echo "=== Install a new bot instance ==="
   read -rp "Bot instance name (e.g. prod, test, myshop): " BOT_NAME_IN
@@ -74,7 +85,7 @@ install_instance() {
   curl -fsSLo telegram_subscription_bot.py "${RAW_BASE}/telegram_subscription_bot.py"
   curl -fsSLo Dockerfile "${RAW_BASE}/Dockerfile"
 
-  # Generate compose per instance
+  # Per-instance compose
   cat > docker-compose.yml <<EOF
 services:
   telegram-bot:
@@ -92,7 +103,7 @@ services:
     restart: unless-stopped
 EOF
 
-  # .env for this instance
+  # .env
   cat > .env <<EOF
 BOT_TOKEN=${BOT_TOKEN}
 ADMIN_CHAT_ID=${ADMIN_CHAT_ID}
@@ -114,21 +125,34 @@ EOF
 }
 
 remove_instance() {
-  echo "=== Remove an existing bot instance ==="
-  read -rp "Bot instance name to remove: " BOT_NAME_IN
-  BOT_NAME="$(slugify "${BOT_NAME_IN:-bot}")"
+  echo "=== Remove a bot instance ==="
+
+  mapfile -t INSTANCES < <(list_instances_raw)
+  if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+    echo "No instances found under ${BASE_DIR}."
+    return 0
+  fi
+
+  echo "Select an instance to remove:"
+  for i in "${!INSTANCES[@]}"; do
+    printf "  %d) %s\n" "$((i+1))" "${INSTANCES[$i]}"
+  done
+
+  local sel
+  read -rp "Enter number: " sel
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#INSTANCES[@]} )); then
+    echo "Invalid selection."
+    return 1
+  fi
+
+  BOT_NAME="${INSTANCES[$((sel-1))]}"
   INSTALL_DIR="${BASE_DIR}/${BOT_NAME}"
   PROJECT_NAME="${BOT_NAME}"
   CONTAINER_NAME="telegram-bot-${BOT_NAME}"
 
-  if [[ ! -d "${INSTALL_DIR}" ]]; then
-    echo "Instance directory not found: ${INSTALL_DIR}"
-    return 1
-  fi
-
-  echo "This will stop and remove container(s) and delete: ${INSTALL_DIR}"
-  read -rp "Type the instance name to confirm (${BOT_NAME}): " CONFIRM
-  if [[ "$(slugify "$CONFIRM")" != "${BOT_NAME}" ]]; then
+  echo "You selected: ${BOT_NAME}"
+  read -rp "Confirm delete '${BOT_NAME}' (y/N): " ok
+  if [[ "${ok,,}" != "y" && "${ok,,}" != "yes" ]]; then
     echo "Aborted."
     return 1
   fi
@@ -143,44 +167,66 @@ remove_instance() {
 }
 
 list_instances() {
-  echo "=== Instances under ${BASE_DIR} ==="
-  if [[ ! -d "${BASE_DIR}" ]]; then
+  echo "=== Instances ==="
+  mapfile -t INSTANCES < <(list_instances_raw)
+  if [[ ${#INSTANCES[@]} -eq 0 ]]; then
     echo "(none)"
     return 0
   fi
-  shopt -s nullglob
-  for d in "${BASE_DIR}"/*; do
-    [[ -d "$d" ]] || continue
-    name="$(basename "$d")"
+  for name in "${INSTANCES[@]}"; do
     echo "- ${name}"
   done
-  shopt -u nullglob
 }
 
 restart_instance() {
-  read -rp "Bot instance name to restart: " BOT_NAME_IN
-  BOT_NAME="$(slugify "${BOT_NAME_IN:-bot}")"
-  PROJECT_NAME="${BOT_NAME}"
-  compose "${PROJECT_NAME}" restart
-  compose "${PROJECT_NAME}" ps
+  mapfile -t INSTANCES < <(list_instances_raw)
+  if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+    echo "No instances found."
+    return 0
+  fi
+  echo "Select an instance to restart:"
+  for i in "${!INSTANCES[@]}"; do
+    printf "  %d) %s\n" "$((i+1))" "${INSTANCES[$i]}"
+  done
+  local sel
+  read -rp "Enter number: " sel
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#INSTANCES[@]} )); then
+    echo "Invalid selection."
+    return 1
+  fi
+  BOT_NAME="${INSTANCES[$((sel-1))]}"
+  compose "${BOT_NAME}" restart
+  compose "${BOT_NAME}" ps
 }
 
 logs_instance() {
-  read -rp "Bot instance name to show logs: " BOT_NAME_IN
-  BOT_NAME="$(slugify "${BOT_NAME_IN:-bot}")"
-  PROJECT_NAME="${BOT_NAME}"
-  compose "${PROJECT_NAME}" logs --tail=200 -f
+  mapfile -t INSTANCES < <(list_instances_raw)
+  if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+    echo "No instances found."
+    return 0
+  fi
+  echo "Select an instance to show logs:"
+  for i in "${!INSTANCES[@]}"; do
+    printf "  %d) %s\n" "$((i+1))" "${INSTANCES[$i]}"
+  done
+  local sel
+  read -rp "Enter number: " sel
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#INSTANCES[@]} )); then
+    echo "Invalid selection."
+    return 1
+  fi
+  BOT_NAME="${INSTANCES[$((sel-1))]}"
+  compose "${BOT_NAME}" logs --tail=200 -f
 }
 
-# ------- CLI shortcuts (optional) -------
-# Usage: install.sh install|remove|list|restart|logs
+# ----- CLI shortcuts -----
 if [[ "${1:-}" == "install" ]]; then require_root; install_docker_if_missing; mkdir -p "${BASE_DIR}"; install_instance; exit 0; fi
 if [[ "${1:-}" == "remove"  ]]; then require_root; mkdir -p "${BASE_DIR}"; remove_instance; exit 0; fi
 if [[ "${1:-}" == "list"    ]]; then require_root; list_instances; exit 0; fi
 if [[ "${1:-}" == "restart" ]]; then require_root; restart_instance; exit 0; fi
 if [[ "${1:-}" == "logs"    ]]; then require_root; logs_instance; exit 0; fi
 
-# ------- TUI Menu -------
+# ----- Menu -----
 menu() {
   echo "=== Sales Manager Bot ==="
   echo "1) Install new bot"
