@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========= Repo Settings (از ریپوی شما) =========
+# ========= Repo Settings =========
 OWNER="ShidRayGit"
 REPO="Sales_Manager_Bot"
 BRANCH="main"
