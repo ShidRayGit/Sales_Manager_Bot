@@ -11,6 +11,7 @@ Features:
 - Daily summary at 09:00 local TZ (from TZ env; default Asia/Dubai) via JobQueue
 - Admin management INSIDE the bot (add/remove/list) via inline buttons
 - Scheduled ZIP backups of the whole bot folder, configurable from inside the bot (send via Telegram)
+- NEW: Restore backup (DB only) via inline button (send ZIP)
 
 Environment (.env) example:
   BOT_TOKEN=123456:ABC...
@@ -27,6 +28,8 @@ Requirements:
 from __future__ import annotations
 
 import os
+import io
+import zipfile
 import sqlite3
 import shutil
 from dataclasses import dataclass
@@ -62,6 +65,7 @@ EMOJI_MENU    = "\U0001F4CB"   # 📋
 EMOJI_ADD     = "\u2795"       # ➕
 EMOJI_REMOVE  = "\u2796"       # ➖
 EMOJI_ADMIN   = "\U0001F464"   # 👤
+EMOJI_RESTORE = "\u267B\uFE0F" # ♻️
 # -------------------------------------------------------------------
 
 DB_PATH = os.environ.get("DB_PATH", "data.db")
@@ -74,6 +78,7 @@ MAX_BACKUP_MB = int(os.environ.get("MAX_BACKUP_MB", "45"))
 
 # Conversation states
 ASK_DESC, ASK_DATE = range(2)
+ASK_RESTORE_ZIP = 100  # <-- new: waiting for ZIP document
 
 # Flag key for admin add/remove capture
 AWAITING_ADMIN_ACTION_KEY = "awaiting_admin_action"  # "add" | "remove"
@@ -290,6 +295,7 @@ def backup_menu_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⏱ هر 12 ساعت", callback_data="backup:on:12"),
          InlineKeyboardButton("⏱ هر 24 ساعت", callback_data="backup:on:24")],
         [InlineKeyboardButton("🛑 غیرفعال", callback_data="backup:off")],
+        [InlineKeyboardButton(f"{EMOJI_RESTORE} بازیابی بکاپ", callback_data="backup:restore")],
         [InlineKeyboardButton("⬅️ بازگشت", callback_data="menu:home")]
     ]
     return InlineKeyboardMarkup(kb)
@@ -668,6 +674,85 @@ async def maybe_capture_admin_id_text(update: Update, context: ContextTypes.DEFA
     return True
 
 
+# ---------- Restore (DB only) ----------
+async def restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt to send a ZIP backup to restore DB."""
+    if not await guard_admin(update):
+        return ConversationHandler.END
+    q = update.callback_query
+    if q:
+        await q.edit_message_text(
+            "فایل بکاپ ZIP را ارسال کن.\n"
+            "توجه: فقط فایل دیتابیس (data.db) از ZIP بازیابی می‌شود.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data="menu:backup")]])
+        )
+    else:
+        await update.effective_chat.send_message(
+            "فایل بکاپ ZIP را ارسال کن (فقط دیتابیس ریستور می‌شود).",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data="menu:backup")]])
+        )
+    return ASK_RESTORE_ZIP
+
+
+async def restore_got_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle uploaded ZIP and restore DB_PATH."""
+    if not await guard_admin(update):
+        return ConversationHandler.END
+    doc = update.message.document if update.message else None
+    if not doc:
+        await update.effective_chat.send_message("❌ لطفاً یک فایل ZIP بفرست.", reply_markup=backup_menu_kb())
+        return ConversationHandler.END
+    fname = (doc.file_name or "").lower()
+    if not (fname.endswith(".zip") or doc.mime_type == "application/zip"):
+        await update.effective_chat.send_message("❌ فرمت نامعتبر. فقط ZIP.", reply_markup=backup_menu_kb())
+        return ConversationHandler.END
+
+    try:
+        f = await doc.get_file()
+        bio = io.BytesIO()
+        await f.download_to_memory(out=bio)
+        bio.seek(0)
+
+        with zipfile.ZipFile(bio, "r") as zf:
+            names = set(zf.namelist())
+            target_db_path = os.environ.get("DB_PATH", "data.db")
+
+            pick = None
+            if "data/data.db" in names:
+                pick = "data/data.db"
+            elif "data.db" in names:
+                pick = "data.db"
+            else:
+                for n in names:
+                    if n.lower().endswith(".db") and not n.endswith("/"):
+                        pick = n
+                        break
+
+            if not pick:
+                await update.effective_chat.send_message("❌ در ZIP فایلی با پسوند .db پیدا نشد.", reply_markup=backup_menu_kb())
+                return ConversationHandler.END
+
+            # backup current db (if exists)
+            try:
+                if os.path.exists(target_db_path):
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    shutil.copy2(target_db_path, f"{target_db_path}.bak-{ts}")
+            except Exception:
+                pass
+
+            # write new db
+            data = zf.read(pick)
+            Path(target_db_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(target_db_path, "wb") as out:
+                out.write(data)
+
+        await update.effective_chat.send_message("✅ دیتابیس بازیابی شد.", reply_markup=backup_menu_kb())
+    except Exception as e:
+        await update.effective_chat.send_message(f"❌ خطا در بازیابی: {e}", reply_markup=backup_menu_kb())
+
+    return ConversationHandler.END
+
+
 # ---------- Inline buttons handler ----------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard_admin(update):
@@ -713,7 +798,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("خطای تنظیم مدت.", reply_markup=main_menu_kb())
         return
 
-    # Backup actions
+    # Backup actions (except restore which has its own conversation)
     if data.startswith("backup:"):
         parts = data.split(":")
         if parts[1] == "now":
@@ -821,7 +906,7 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("export", export_csv))
 
     # Conversation: /add and inline menu:add
-    conv = ConversationHandler(
+    conv_add = ConversationHandler(
         entry_points=[
             CommandHandler("add", add_start),
             CallbackQueryHandler(add_start, pattern="^menu:add$"),
@@ -834,12 +919,24 @@ def build_app(token: str) -> Application:
         name="add_conv",
         persistent=False,
     )
-    app.add_handler(conv)
+    app.add_handler(conv_add)
+
+    # Conversation: backup restore (entry via backup:restore, then wait for ZIP)
+    conv_restore = ConversationHandler(
+        entry_points=[CallbackQueryHandler(restore_start, pattern="^backup:restore$")],
+        states={
+            ASK_RESTORE_ZIP: [MessageHandler(filters.Document.ALL, restore_got_zip)],
+        },
+        fallbacks=[],
+        name="restore_conv",
+        persistent=False,
+    )
+    app.add_handler(conv_restore)
 
     # Capture admin add/remove numeric input (outside conversations)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: maybe_capture_admin_id_text(u, c)))
 
-    # Inline button handler
+    # Inline button handler (generic)
     app.add_handler(CallbackQueryHandler(on_button))
 
     # Daily summary at 09:00
